@@ -11,11 +11,10 @@ import os
 import sys
 import subprocess
 from collections import namedtuple
-from exceptions import ValueError
 from operator import attrgetter
 
 from git import Repo
-from git.exc import GitCommandError
+from git.exc import GitCommandError,  InvalidGitRepositoryError
 
 from .settings import settings
 
@@ -34,22 +33,22 @@ class Aborted(object):
         self.log = None
 
 
-def abort(message, log=None):
+def abort(message, log=None, type=None):
 
     a = Aborted()
     a.message = message
     a.log = log
 
-    settings.abort_handler(a)
+    settings.abort_handler(a, type=type)
 
 def repo_check(require_remote=False):
     if repo is None:
-        print 'Not a git repository.'
+        print('Not a git repository.')
         sys.exit(128)
 
     # TODO: no remote fail
     if not repo.remotes and require_remote:
-        print 'No git remotes configured. Please add one.'
+        print('No git remotes configured. Please add one.')
         sys.exit(128)
 
     # TODO: You're in a merge state.
@@ -74,7 +73,7 @@ def unstash_index(sync=False, branch=None):
         'stash', 'list'])
 
     if branch is None:
-        branch = repo.head.ref.name
+        branch = get_current_branch_name()
 
     for stash in stash_list.splitlines():
 
@@ -114,7 +113,7 @@ def smart_pull():
 
     repo_check()
 
-    branch = repo.head.ref.name
+    branch = get_current_branch_name()
 
     fetch()
 
@@ -125,7 +124,7 @@ def smart_merge(branch, allow_rebase=True):
 
     repo_check()
 
-    from_branch = repo.head.ref.name
+    from_branch = get_current_branch_name()
 
     merges = repo.git.execute([git,
         'log', '--merges', '{0}..{1}'.format(branch, from_branch)])
@@ -137,9 +136,10 @@ def smart_merge(branch, allow_rebase=True):
 
     try:
         return repo.git.execute([git, verb, branch])
-    except GitCommandError, why:
-        log = repo.git.execute([git,'merge', '--abort'])
-        abort('Merge failed. Reverting.', log=why)
+    except GitCommandError as why:
+        log = repo.git.execute([git, verb, '--abort'])
+        abort('Merge failed. Reverting.',
+              log='{0}\n{1}'.format(why, log), type='merge')
 
 
 
@@ -158,7 +158,9 @@ def checkout_branch(branch):
 
     repo_check()
 
-    return repo.git.execute([git, 'checkout', branch])
+    _, stdout, stderr = repo.git.execute([git, 'checkout', branch],
+                                         with_extended_output=True)
+    return '\n'.join([stderr, stdout])
 
 
 def sprout_branch(off_branch, branch):
@@ -179,9 +181,10 @@ def graft_branch(branch):
     try:
         msg = repo.git.execute([git, 'merge', '--no-ff', branch])
         log.append(msg)
-    except GitCommandError, why:
+    except GitCommandError as why:
         log = repo.git.execute([git,'merge', '--abort'])
-        abort('Merge failed. Reverting.', log='{0}\n{1}'.format(why, log))
+        abort('Merge failed. Reverting.',
+              log='{0}\n{1}'.format(why, log), type='merge')
 
 
     out = repo.git.execute([git, 'branch', '-D', branch])
@@ -194,8 +197,13 @@ def unpublish_branch(branch):
 
     repo_check()
 
-    return repo.git.execute([git,
-        'push', remote.name, ':{0}'.format(branch)])
+    try:
+        return repo.git.execute([git,
+            'push', remote.name, ':{0}'.format(branch)])
+    except GitCommandError:
+        _, _, log = repo.git.execute([git, 'fetch', remote.name, '--prune'],
+                                     with_extended_output=True)
+        abort('Unpublish failed. Fetching.', log=log, type='unpublish')
 
 
 def publish_branch(branch):
@@ -210,14 +218,10 @@ def publish_branch(branch):
 def get_repo():
     """Returns the current Repo, based on path."""
 
-    work_path = subprocess.Popen([git, 'rev-parse', '--show-toplevel'],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE).communicate()[0].rstrip('\n')
-
-    if work_path:
-        return Repo(work_path)
-    else:
-        return None
+    try:
+        return Repo(search_parent_directories=True)
+    except InvalidGitRepositoryError:
+        pass
 
 
 def get_remote():
@@ -226,12 +230,8 @@ def get_remote():
 
     reader = repo.config_reader()
 
-    # If there is no legit section return the default remote.
-    if not reader.has_section('legit'):
-        return repo.remotes[0]
-
-    # If there is no remote option in the legit section return the default.
-    if not any('legit' in s and 'remote' in s for s in reader.sections()):
+    # If there is no remote option in legit section, return default
+    if not reader.has_option('legit', 'remote'):
         return repo.remotes[0]
 
     remote_name = reader.get('legit', 'remote')
@@ -240,6 +240,14 @@ def get_remote():
                          'configuration.'.format(remote_name))
 
     return repo.remote(remote_name)
+
+
+def get_current_branch_name():
+    """Returns current branch name"""
+
+    repo_check()
+
+    return repo.head.ref.name
 
 
 def get_branches(local=True, remote_branches=True):
@@ -258,7 +266,7 @@ def get_branches(local=True, remote_branches=True):
                 name = '/'.join(b.name.split('/')[1:])
 
                 if name not in settings.forbidden_branches:
-                    branches.append(Branch(name, True))
+                    branches.append(Branch(name, is_published=True))
         except (IndexError, AssertionError):
             pass
 
@@ -269,7 +277,7 @@ def get_branches(local=True, remote_branches=True):
 
             if b not in [br.name for br in branches] or not remote_branches:
                 if b not in settings.forbidden_branches:
-                    branches.append(Branch(b, False))
+                    branches.append(Branch(b, is_published=False))
 
 
     return sorted(branches, key=attrgetter('name'))
@@ -285,4 +293,5 @@ def get_branch_names(local=True, remote_branches=True):
 
 
 repo = get_repo()
-remote = get_remote()
+if repo:  # in git repository
+    remote = get_remote()
